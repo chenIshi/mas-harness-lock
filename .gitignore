@@ -1,0 +1,9 @@
+# Fetched copies of third-party papers — retrievable from the URLs recorded in
+# doc/reference/papers.md, and not ours to redistribute. Kept locally so the
+# quotes in doc/reference/ can be re-checked offline against the exact version.
+doc/reference/papers/
+
+
+# Added by cargo
+
+/target

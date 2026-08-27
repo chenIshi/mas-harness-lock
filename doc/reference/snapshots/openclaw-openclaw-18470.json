@@ -1,0 +1,119 @@
+{
+  "url": "https://api.github.com/repos/openclaw/openclaw/issues/18470",
+  "repository_url": "https://api.github.com/repos/openclaw/openclaw",
+  "labels_url": "https://api.github.com/repos/openclaw/openclaw/issues/18470/labels{/name}",
+  "comments_url": "https://api.github.com/repos/openclaw/openclaw/issues/18470/comments",
+  "events_url": "https://api.github.com/repos/openclaw/openclaw/issues/18470/events",
+  "html_url": "https://github.com/openclaw/openclaw/issues/18470",
+  "id": 3949095709,
+  "node_id": "I_kwDOQb6kR87rYmsd",
+  "number": 18470,
+  "title": "[Bug]: Gateway Deadlock: Internal Commands Hang When Called During Active Agent Turn",
+  "user": {
+    "login": "sbmilburn",
+    "id": 11755869,
+    "node_id": "MDQ6VXNlcjExNzU1ODY5",
+    "avatar_url": "https://avatars.githubusercontent.com/u/11755869?v=4",
+    "gravatar_id": "",
+    "url": "https://api.github.com/users/sbmilburn",
+    "html_url": "https://github.com/sbmilburn",
+    "followers_url": "https://api.github.com/users/sbmilburn/followers",
+    "following_url": "https://api.github.com/users/sbmilburn/following{/other_user}",
+    "gists_url": "https://api.github.com/users/sbmilburn/gists{/gist_id}",
+    "starred_url": "https://api.github.com/users/sbmilburn/starred{/owner}{/repo}",
+    "subscriptions_url": "https://api.github.com/users/sbmilburn/subscriptions",
+    "organizations_url": "https://api.github.com/users/sbmilburn/orgs",
+    "repos_url": "https://api.github.com/users/sbmilburn/repos",
+    "events_url": "https://api.github.com/users/sbmilburn/events{/privacy}",
+    "received_events_url": "https://api.github.com/users/sbmilburn/received_events",
+    "type": "User",
+    "user_view_type": "public",
+    "site_admin": false
+  },
+  "labels": [
+    {
+      "id": 9706244967,
+      "node_id": "LA_kwDOQb6kR88AAAACQomLZw",
+      "url": "https://api.github.com/repos/openclaw/openclaw/labels/bug",
+      "name": "bug",
+      "color": "d73a4a",
+      "default": true,
+      "description": "Something isn't working"
+    },
+    {
+      "id": 10174413390,
+      "node_id": "LA_kwDOQb6kR88AAAACXnE6Tg",
+      "url": "https://api.github.com/repos/openclaw/openclaw/labels/stale",
+      "name": "stale",
+      "color": "F7E7A1",
+      "default": false,
+      "description": "Marked as stale due to inactivity"
+    }
+  ],
+  "state": "closed",
+  "locked": true,
+  "assignees": [
+
+  ],
+  "milestone": null,
+  "comments": 7,
+  "created_at": "2026-02-16T18:41:06Z",
+  "updated_at": "2026-03-23T04:13:01Z",
+  "closed_at": "2026-03-21T04:02:00Z",
+  "assignee": null,
+  "author_association": "NONE",
+  "issue_field_values": [
+
+  ],
+  "type": null,
+  "active_lock_reason": "resolved",
+  "sub_issues_summary": {
+    "total": 0,
+    "completed": 0,
+    "percent_completed": 0
+  },
+  "issue_dependencies_summary": {
+    "blocked_by": 0,
+    "total_blocked_by": 0,
+    "blocking": 0,
+    "total_blocking": 0
+  },
+  "body": "### Summary\n\n**OpenClaw Version:** 2026.2.15   \n**Platform:** Ubunutu 24.04 Linux (viernode)  \n**Node Version:** v25.6.1  \n**Category:** Gateway / Command Processing  \n\n\nOpenClaw gateway **deadlocks or blocks** when internal commands (`openclaw sessions --json`, `cron list` tool) are invoked **from within an active agent session turn**. Commands hang for exactly 10 minutes (embedded run timeout), then fail, causing:\n\n1. **Embedded run timeout** after 10 minutes\n2. **Spend limit exhaustion** on primary provider (Anthropic)\n3. **Failover cascade** to backup providers (OpenRouter Haiku)\n4. **Rate limit errors** on failover providers\n5. **Significant credit burn** from retry storms\n\n**Key insight:** This is **not** a cron or heartbeat bug. Both are just triggers that expose the underlying issue: **the gateway cannot process introspection requests while handling an active LLM turn**.\n\n## Root Cause Analysis\n\n### What's Actually Broken\n\nThe gateway appears to have a **self-request deadlock** or **resource lock issue**:\n\n1. Agent session turn begins (LLM request active)\n2. Agent invokes tool that calls an internal OpenClaw command (e.g., `exec(\"openclaw sessions --json\")` or `cron(action: \"list\")`)\n3. Internal command needs to query the gateway for state\n4. **Gateway cannot respond** - possibly because:\n   - It's waiting for the agent turn to complete before processing new requests\n   - A lock/mutex on session state is held during LLM turns\n   - Request queue is blocked by the active session\n5. Command hangs until embedded run timeout (10 minutes)\n6. Agent turn fails, triggers retry storm\n\n### What's NOT the Problem\n\n- ❌ **Not a heartbeat bug** - Heartbeat is just a timer triggering a normal agent turn\n- ❌ **Not a cron bug** - System cron jobs (bash scripts at 3 AM, 4 AM, 6 AM) work fine\n- ❌ **Not the `cron list` tool** - Both `cron list` AND `openclaw sessions --json` hang identically\n- ❌ **Not QMD indexing** - Separate, unrelated config issue (already fixed)\n\n### Evidence This Is a Gateway Issue\n\n1. **Only happens during active agent turns** - Standalone bash scripts calling `openclaw` commands work fine\n2. **Affects multiple internal commands** - Both CLI (`openclaw sessions`) and tool API (`cron list`) hang\n3. **Consistent 10-minute timeout** - Matches embedded run timeout exactly (600000ms)\n4. **No external factors** - System is idle (no CPU/memory issues, no stuck processes)\n\n\n\n### Steps to reproduce\n\n### Minimal Reproduction\n\n1. Start an agent session (any channel)\n2. During an agent turn, invoke ANY internal OpenClaw command:\n   - `exec` tool: `openclaw sessions --json`\n   - `exec` tool: `openclaw cron list`\n   - `cron` tool: `action: \"list\"`\n3. Observe: Command hangs for 10 minutes, then times out\n\n### How We Discovered It\n\n1. Configured periodic heartbeat checks (every 10 minutes)\n2. Heartbeat invokes tools to check system health:\n   - `exec(\"openclaw sessions --json\")` to review usage\n   - `cron(action: \"list\")` to verify cron job health\n3. Commands hang → timeout → spend limit exhausted → rate limits → credit burn\n\n## Timeline of Events\n\n### First Occurrence (2026-02-16 08:15:58 AM)\n```\n08:15:58 - Heartbeat triggered (normal agent turn begins)\n08:15:58 - Tool call: exec(\"openclaw sessions --json\")\n08:15:58 - [Command sent to gateway, never receives response]\n08:25:58 - [10 minutes later] Embedded run timeout\n08:25:58 - 402 Error: \"API key USD spend limit exceeded\" (Anthropic)\n08:26:14 - Retry attempt (failover to OpenRouter)\n08:26:42 - Rate limit error: \"API rate limit reached\"\n```\n\n### Second Occurrence (2026-02-16 08:56:14 AM)\n```\n08:56:14 - Heartbeat triggered (normal agent turn begins)\n08:56:14 - Tool call: cron(action: \"list\")\n08:56:14 - [Command sent to gateway, never receives response]\n09:06:14 - [Expected timeout in 10 minutes]\n08:56:14 - 402 Error: \"API key USD spend limit exceeded\" (Anthropic)\n08:56:50 - Rate limit error: \"API rate limit reached\"\n```\n\n## Log Evidence\n\n### Timeout Pattern (Embedded Run)\n```\nFeb 16 08:25:58 viernode node[41303]: 2026-02-16T16:25:58.525Z [agent/embedded] embedded run timeout: runId=91dc3a6d-97b1-4274-9af8-1899a8a65abe sessionId=885a016a-238f-4afe-af7d-3503635334fb timeoutMs=600000\n```\n\n### Spend Limit Exhaustion\n```\nFeb 16 08:25:58 viernode node[41303]: 2026-02-16T16:25:58.531Z [diagnostic] lane task error: lane=main durationMs=600037 error=\"FailoverError: 402 Provider returned error\n{\"error\":\"API key USD spend limit exceeded. Your account may still have USD balance, but this API key has reached its configured USD spending limit.\"}\"\n```\n\n### Rate Limit on Failover\n```\nFeb 16 08:26:42 viernode node[41303]: 2026-02-16T16:26:42.869Z [diagnostic] lane task error: lane=main durationMs=28818 error=\"FailoverError: ⚠️ API rate limit reached. Please try again later.\"\n```\n\n## Environment Details\n\n```bash\n# System\nOS: Linux (viernode)\nNode: v25.6.1\nShell: bash\n\n# OpenClaw\nGateway: openclaw-gateway (single process, PID 41303)\nSession count: 142 total sessions\nActive sessions: 1 (during hang)\nCron jobs: 2 (both healthy, no recent runs)\n\n# QMD Collections\n- workspace\n- openclaw-docs\n- clawhub-docs\n- openrouter-docs\n```\n\n### Session Information\n- **Session ID:** `885a016a-238f-4afe-af7d-3503635334fb`\n- **Model:** `anthropic/claude-sonnet-4.5` (via OpenRouter)\n- **Context Tokens:** 200000\n- **Session Type:** Main agent session (WhatsApp channel)\n\n\n### Expected behavior\n\nWhen an agent invokes `exec(\"openclaw sessions --json\")` or `cron(action: \"list\")`:\n1. Gateway receives request\n2. Gateway queries internal state (sessions.json, cron jobs)\n3. Gateway returns response within < 1 second\n4. Agent turn continues normally\n\n\n### Actual behavior\n\nWhen an agent invokes internal commands during an active turn:\n1. Gateway receives request\n2. **Gateway blocks/deadlocks** (cannot respond while agent turn is active)\n3. Command hangs for 10 minutes\n4. Embedded run timeout triggers\n5. Agent turn fails → retry → failover cascade → credit burn\n\n\n### OpenClaw version\n\n2026.2.15\n\n### Operating system\n\nUbunutu 24.04\n\n### Install method\n\nnpm global\n\n### Logs, screenshots, and evidence\n\n```shell\n## Timeline of Events\n\n### First Occurrence (2026-02-16 08:15:58 AM)\n\n08:15:58 - Heartbeat triggered (normal agent turn begins)\n08:15:58 - Tool call: exec(\"openclaw sessions --json\")\n08:15:58 - [Command sent to gateway, never receives response]\n08:25:58 - [10 minutes later] Embedded run timeout\n08:25:58 - 402 Error: \"API key USD spend limit exceeded\" (Anthropic)\n08:26:14 - Retry attempt (failover to OpenRouter)\n08:26:42 - Rate limit error: \"API rate limit reached\"\n\n\n### Second Occurrence (2026-02-16 08:56:14 AM)\n\n08:56:14 - Heartbeat triggered (normal agent turn begins)\n08:56:14 - Tool call: cron(action: \"list\")\n08:56:14 - [Command sent to gateway, never receives response]\n09:06:14 - [Expected timeout in 10 minutes]\n08:56:14 - 402 Error: \"API key USD spend limit exceeded\" (Anthropic)\n08:56:50 - Rate limit error: \"API rate limit reached\"\n\n\n## Log Evidence\n\n### Timeout Pattern (Embedded Run)\n\nFeb 16 08:25:58 viernode node[41303]: 2026-02-16T16:25:58.525Z [agent/embedded] embedded run timeout: runId=91dc3a6d-97b1-4274-9af8-1899a8a65abe sessionId=885a016a-238f-4afe-af7d-3503635334fb timeoutMs=600000\n\n\n### Spend Limit Exhaustion\n\nFeb 16 08:25:58 viernode node[41303]: 2026-02-16T16:25:58.531Z [diagnostic] lane task error: lane=main durationMs=600037 error=\"FailoverError: 402 Provider returned error\n{\"error\":\"API key USD spend limit exceeded. Your account may still have USD balance, but this API key has reached its configured USD spending limit.\"}\"\n```\n\n### Impact and severity\n\n- **High credit cost** from retry storms during failover (10 minutes × expensive model × retries)\n- **Heartbeat checks disabled** to prevent further credit burn\n- **Agent functionality degraded** (cannot perform periodic health checks)\n- **Spend limits exhausted** on primary provider\n- **Introspection impossible** - Agents cannot query their own system state\n\n\n### Additional information\n\n## Workaround\n\nTemporarily disabled all heartbeat checks to prevent internal command invocations during agent turns.\n\n**Alternative workaround (untested):** Move introspection to standalone bash scripts outside of agent turns, then inject results as system messages.\n\n## Diagnostic Questions\n\n1. **Is there a known limitation** where internal commands cannot be invoked during active agent turns?\n2. **Is there a request queue** that blocks internal commands when an LLM request is active?\n3. **Are there locks/mutexes** held during agent turns that prevent state queries?\n4. **Could session count (142) affect** gateway's ability to process internal commands quickly?\n5. **Are there any gateway logs** showing what happens when these commands are invoked?\n\n## Requested Actions\n\n1. **Investigate gateway request handling** - Why do internal commands block during active turns?\n2. **Add circuit breaker or shorter timeout** - 10 minutes is far too long for internal commands\n3. **Document limitations** - If introspection during agent turns isn't supported, document it\n4. **Consider async handling** - Allow internal commands to be processed concurrently with agent turns\n5. **Add diagnostic logging** - Log when internal commands are queued/blocked/timeout\n\n",
+  "closed_by": {
+    "login": "openclaw-barnacle[bot]",
+    "id": 257215752,
+    "node_id": "BOT_kgDOD1TNCA",
+    "avatar_url": "https://avatars.githubusercontent.com/in/2729701?v=4",
+    "gravatar_id": "",
+    "url": "https://api.github.com/users/openclaw-barnacle%5Bbot%5D",
+    "html_url": "https://github.com/apps/openclaw-barnacle",
+    "followers_url": "https://api.github.com/users/openclaw-barnacle%5Bbot%5D/followers",
+    "following_url": "https://api.github.com/users/openclaw-barnacle%5Bbot%5D/following{/other_user}",
+    "gists_url": "https://api.github.com/users/openclaw-barnacle%5Bbot%5D/gists{/gist_id}",
+    "starred_url": "https://api.github.com/users/openclaw-barnacle%5Bbot%5D/starred{/owner}{/repo}",
+    "subscriptions_url": "https://api.github.com/users/openclaw-barnacle%5Bbot%5D/subscriptions",
+    "organizations_url": "https://api.github.com/users/openclaw-barnacle%5Bbot%5D/orgs",
+    "repos_url": "https://api.github.com/users/openclaw-barnacle%5Bbot%5D/repos",
+    "events_url": "https://api.github.com/users/openclaw-barnacle%5Bbot%5D/events{/privacy}",
+    "received_events_url": "https://api.github.com/users/openclaw-barnacle%5Bbot%5D/received_events",
+    "type": "Bot",
+    "user_view_type": "public",
+    "site_admin": false
+  },
+  "reactions": {
+    "url": "https://api.github.com/repos/openclaw/openclaw/issues/18470/reactions",
+    "total_count": 2,
+    "+1": 2,
+    "-1": 0,
+    "laugh": 0,
+    "hooray": 0,
+    "confused": 0,
+    "heart": 0,
+    "rocket": 0,
+    "eyes": 0
+  },
+  "timeline_url": "https://api.github.com/repos/openclaw/openclaw/issues/18470/timeline",
+  "performed_via_github_app": null,
+  "state_reason": "not_planned",
+  "pinned_comment": null
+}
