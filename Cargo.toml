@@ -1,0 +1,10 @@
+[package]
+name = "mas-harness-lock"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "time", "macros", "sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "time", "macros", "sync", "test-util"] }
