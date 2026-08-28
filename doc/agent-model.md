@@ -1,8 +1,14 @@
-# The error-prone agent model
+# The agent capability model
 
 **Status:** spec for the v1 test harness — not yet implemented
-**Scope:** handover §8's "modeled agents, not real LLM calls"
-**Sources:** [doc/reference/](reference/) — every race below cites what it came from
+**What this is:** a model of what a real LLM agent *can* do — its capabilities and failure modes,
+not a script for what one imagined agent does — used to derive test races for the harness described
+in [`handover.md`](handover.md). See handover §8, "modeled agents, not real LLM calls."
+**Read first:** [`handover.md`](handover.md) §1 and §3 for the design rule this model exists to
+test against; this doc does not restate that argument, only applies it.
+**Sources:** [doc/reference/](reference/) — `papers.md`, `field-reports.md`, `lock-primitives.md`.
+Every external claim below links to its source there rather than to memory; read the reference docs
+for verbatim quotes and full citations.
 
 ---
 
@@ -28,19 +34,60 @@ reads as obvious once you know it and as noise until then.
 | **heavy-tailed** | a delay that is usually quick but occasionally *far* slower — so no single timeout value works well |
 | **the blind interval** | any stretch where the harness gets no signal at all, so it cannot tell slow from stuck |
 
-## 1. Why a scripted model, restated
+## 1. What this model is: capabilities, not content
 
-Handover §8 already argues this, but the reason matters for the parameter design: the harness's
-correctness depends only on **the pattern and timing of acquire/read/write/release calls**, never on
-what an agent decides to write. So the model does not generate content. It emits a call trace.
+A capability model states what an agent **can** do, so the harness can be tested against the worst
+thing in that range rather than the typical thing. It is deliberately not a claim about what any
+particular agent *will* do on a given run — see §1.2 for why that distinction collapses anyway.
+
+### 1.1 Two capability facts that drive the whole design
+
+**Fact 1 — anything an agent's generated code may get wrong, it must be treated as eventually
+getting wrong.** If agent-generated code could call lock `acquire`/`release` directly, "an agent
+might forget the matching release" is not a tail risk to discount — over enough runs it becomes "an
+agent will forget it," for exactly the reason [`handover.md`](handover.md)'s §1 gives for why a
+coordination guarantee cannot live in a prompt or a role label: a guarantee that depends on every
+call site being written correctly survives only until the first one is not. §1.2 below applies that
+argument at this level; it is not re-derived here. The consequence for design: handover §5's option
+(a) removes raw lock primitives from the agent's reachable surface entirely, so there is nothing for
+a "may" to eventually become a "would" *of* — see §2, where the event alphabet has no
+`acquire`/`release` events for exactly this reason.
+
+**Fact 2 — decode has two distinct capability modes, and the harness's ability to detect a hang
+differs between them.**
+
+- **Streaming decode.** Tokens arrive one at a time, so each arriving token is a liveness signal. A
+  stream that goes quiet mid-generation is observable — this is the exact dropped-connection failure
+  in [pi#5778](reference/field-reports.md).
+- **Non-streaming (batched) decode.** One blocking call, response ready or not. No intermediate
+  signal exists between the call starting and it returning; a hang here is indistinguishable from a
+  slow-but-healthy response until a whole-call timeout fires.
+- **Tool execution is a separate phase from decode, in either mode, and it is never streamed** — a
+  tool call is one blocking operation with no token-like heartbeat, by definition. This is where
+  [pi#5778](reference/field-reports.md)'s
+  *second* unbounded wait lived, and in an agentic tool-calling loop it is the phase where long
+  unobserved waits actually concentrate: a tool call must complete before the agent can continue no
+  matter how its decode is served.
+
+These two facts are why the model needs a `streaming` flag and a `hang_at` phase marker (§3): "is
+this agent alive?" has a different answer depending on which phase it is in, and that difference has
+to be a first-class part of the model, not an afterthought bolted on later (§5.2 works through the
+consequence in full).
+
+### 1.2 Why the model emits a call trace, not content
+
+Given §1.1, the harness's correctness depends only on **the pattern and timing of
+acquire/read/write/release calls**, never on what an agent decides to write — so the model does not
+generate content at all. It emits a call trace: a sequence of the events in §2, timed and ordered by
+the parameters in §3.
 
 That buys the thing real LLM calls cannot: **the adversarial interleavings become constructible and
 replayable on purpose** rather than hoped for. Same principle as Jepsen-style testing. A race that
 fires on 5% of real runs is a race you cannot debug; a race you script fires every time.
 
-Corollary worth stating explicitly, because it bounds what v1's results can claim: this harness can
-prove the mechanism gates correctly under a given interleaving. It cannot say how *often* real
-agents produce that interleaving. That is the model-behavior question handover §8 defers, and no
+**What this can and cannot prove, stated so it is not overclaimed later:** this harness can prove the
+mechanism gates correctly under a given interleaving. It cannot say how *often* real agents produce
+that interleaving — that is a separate, model-*behavior* question (handover §8 defers it), and no
 amount of scripted testing answers it.
 
 ---
@@ -61,20 +108,12 @@ mediated action. Which is the whole point; there is nothing for the agent to get
 | `crash()` | process death, no cleanup | only via DLM liveness |
 | `hang()` | never returns, process stays alive | **no** — indistinguishable from `decide(∞)` |
 
-`hang()` versus a long `decide()` is what R4 turns on — but **how indistinguishable they are depends
-on the serving mode**, which the first version of this doc got wrong by treating as uniform:
-
-- **Streaming decode:** each arriving token is a liveness signal. `decide` is *not* a blind interval
-  — the harness sitting in the stream sees a heartbeat per chunk, and a stream that goes quiet when
-  tokens were expected is exactly the dropped-connection case in pi#5778. Distinguishable.
-- **Non-streaming decode:** one blocking call, no intermediate signal. Indistinguishable; the best
-  available check is a timeout on the whole call.
-- **Tool execution, either mode:** no tokens at all, by definition. Indistinguishable — and this is
-  where the long unbounded waits actually live in an agent loop (a hung subprocess, a network call
-  that never returns). pi#5778 had *two* unbounded waits, and this was the second one.
-
-So the model needs `hang_at` to distinguish `stream` from `tool` (it already does) *and* a
-serving-mode flag, because the harness's ability to detect the hang differs per phase. See §5.2.
+`hang()` versus a long `decide()` is what R4 turns on, and **how indistinguishable they are depends on
+which capability mode from §1.1 the agent is in**: distinguishable under streaming decode (a token
+heartbeat that goes quiet is observable), not distinguishable under non-streaming decode or tool
+execution (both are opaque, blocking calls). That is why the model carries both a `streaming` flag
+and a `hang_at` phase marker (`stream` vs `tool`) rather than one undifferentiated "hang" event — §5.2
+works through what the harness can actually do with each case.
 
 ---
 
@@ -85,21 +124,21 @@ is real rather than invented.
 
 | Parameter | Domain | Failure it induces | Source |
 |---|---|---|---|
-| `decide_ms` | int \| ∞ | long hold — the thing that turns cheap DB locking expensive | CoAgent §3.3 |
-| `streaming` | bool | whether decode emits a token heartbeat — decides if `hang_at: stream` is detectable at all | pi#5778, §5.2 |
+| `decide_ms` | int \| ∞ | long hold — the thing that turns cheap DB locking expensive | [CoAgent §3.3](reference/papers.md) |
+| `streaming` | bool | whether decode emits a token heartbeat — decides if `hang_at: stream` is detectable at all | [pi#5778](reference/field-reports.md), §5.2 |
 | `decide_dist` | fixed \| lognormal \| pareto(α) | latency *distribution*, not a constant — a heavy tail is what breaks fixed ceilings (§5.5) | §5.5 |
 | `load_spike_at` | none \| ms | inflate all agents' latency at once, to produce correlated revocation | §5.5 |
-| `write_ms` | int | slow write; lease expiry *mid-write* | Kleppmann |
-| `hang_at` | none \| stream \| tool | unbounded hold, process alive and healthy | pi#5778 |
+| `write_ms` | int | slow write; lease expiry *mid-write* | [Kleppmann](handover.md) |
+| `hang_at` | none \| stream \| tool | unbounded hold, process alive and healthy | [pi#5778](reference/field-reports.md) |
 | `crash_at` | none \| after_read \| after_acquire \| mid_write \| before_release | total process death | handover §5 |
-| `write_after_expiry` | bool | zombie writer — writes believing it still holds | Kleppmann |
+| `write_after_expiry` | bool | zombie writer — writes believing it still holds | [Kleppmann](handover.md) |
 | `report_early` | bool | self-report before verification; unlocks dependents on an unverified basis | handover §2, §8 |
 | `wrong` | bool | deliberately wrong output, injected later as a "bug" | handover §8 |
-| `stale_write` | bool | writes content computed from a value since overwritten | A1 Stale-Generation |
-| `role` | writer \| dependent \| preemptor | control-plane contention for the data-plane lock | mofa#1022, openclaw#18470 |
-| `reacquire_on_retry` | bool | self-deadlock (non-reentrant) or silent leak (reentrant) — see R9 | Curator, reentrant-mutex docs |
+| `stale_write` | bool | writes content computed from a value since overwritten | [A1 Stale-Generation](reference/papers.md) |
+| `role` | writer \| dependent \| preemptor | control-plane contention for the data-plane lock | [mofa#1022, openclaw#18470](reference/field-reports.md) |
+| `reacquire_on_retry` | bool | self-deadlock (non-reentrant) or silent leak (reentrant) — see R9 | [Curator, reentrant-mutex docs](reference/lock-primitives.md) |
 | `abandon_after_read` | bool | acquires, decides not to write, exits | — |
-| `write_order` | in-order \| permuted | multiple effects externalized out of intended order | A6 |
+| `write_order` | in-order \| permuted | multiple effects externalized out of intended order | [A6](reference/papers.md) |
 | `n_resources` | int (v1: 1) | multi-lock deadlock — parameterized now, exercised post-v1 | handover §7.3 |
 
 `role: preemptor` is the parameter the original handover §8 sketch was missing. It is not a writer at all —
@@ -110,9 +149,13 @@ mofa#1022 family is untestable, because that bug only appears when something nee
 
 ## 4. Named races
 
-Each: setup → what an unprotected baseline does → what the harness must do → what it proves.
-R1–R3 formalize races handover §8 already names. R4, R6–R11, R13 and R14 are new. R5 is demoted
-(§5.4); R12 is specified but deferred to v2 (§5.4c).
+Each entry below follows the same four-part shape: setup → what an unprotected baseline does → what
+the harness must do → what it proves. R1–R3 formalize races handover §8 already names; R4 and
+R6–R11, R13, R14 were added while writing this model. Two numbers are deliberately not full test
+races and are marked as such where they appear: **R5** is a real failure but out of the lock's scope
+(§5.4 explains why, and it stays in this list only as a documented boundary); **R12** is specified
+now but its test is deferred to v2 (§5.4c) because running it needs a harness that can restart,
+which v1 does not build.
 
 **R1 — Two writers collide.** Two `writer`s, overlapping `decide`, both `write(r)`. Baseline: last
 write wins, first is lost silently. Harness: one write lands, the other is serialized behind it or
@@ -134,7 +177,7 @@ indefinitely and **every other writer is blocked forever**. Harness: the preempt
 **without ever acquiring the protected lock**. *Proves: revocation is possible without contending for
 the resource.*
 
-  > **Framing correction 2026-08-27 — the mofa#1022 analogy is narrower than earlier drafts claimed.**
+  > **The mofa#1022 analogy is narrower than it first looks — read this before citing it.**
   > mofa locks **the agent object**; this design locks **the file**. In mofa the stuck thing and the
   > locked thing are the same object, which is exactly why `stop_agent` deadlocks: stopping requires
   > touching the agent, and the agent is locked. Here they are separate — a stuck agent holds the file
@@ -156,12 +199,14 @@ the resource.*
   > write lock. **The bug is the duration, not the existence of the lock**, and the issue's own
   > long-term fix is to change the signature to `&self` so exclusivity stops being required.
 
-**R5 — Self-report races verification.** *(Demoted 2026-08-27 — kept as a scope boundary, not a
-race the lock must pass. See §5.4.)* A `writer` with `report_early: true, wrong: true` and a
+**R5 — Self-report races verification.** *Not a race the lock must pass — kept as a documented scope
+boundary. See §5.4 for the full argument.* A `writer` with `report_early: true, wrong: true` and a
 `dependent` blocked on it: the self-report unlocks the dependent, a bug surfaces later, the
-dependent's work is discarded. Real failure, filed under the wrong mechanism — it is a task
-*dependency* question, not a lock question. The `report_early` and `wrong` knobs stay in §3 so the
-scenario can be *demonstrated*, but the harness is not expected to prevent it.
+dependent's work is discarded. This is a real failure, but it is filed under the wrong mechanism — it
+is a task-*dependency* question (does the dependent wait for verification?), not a mutual-exclusion
+question (can two agents write at once?), and v1 is a lock and nothing else. The `report_early` and
+`wrong` knobs stay in §3 so the scenario can still be *demonstrated* in the conformance demo (§6),
+but the harness is not expected to prevent it, and no test asserts that it does.
 
 **R11 — False revocation under a heavy tail.** `decide_dist: pareto`, ceiling set below the tail: a
 slow-but-perfectly-healthy holder overruns, gets revoked, then finishes and tries to write. Harness:
@@ -175,7 +220,7 @@ acquire/release is correct and the result is still wrong. Harness (write-only sp
 without a freshness check** — this is handover §7.1 with no mitigation, and the test should assert
 the failure rather than pretend otherwise. Harness (full span): passes for free, per §5.2.
 *Proves: mutual exclusion is not sufficient for correctness — the sharpest single argument for the
-full-span option, and A1 Stale-Generation exactly.*
+full-span option, and exactly the anomaly [A1 Stale-Generation](reference/papers.md) formalizes.*
 
   > **Split the two halves; only one is in scope.** *Mechanical:* the bytes read are no longer the
   > current bytes — caught by a version number / compare-and-swap, no understanding of the code
@@ -186,20 +231,22 @@ full-span option, and A1 Stale-Generation exactly.*
   > **This is textbook, under three names** — worth knowing so we cite rather than reinvent:
   > *lost update* (classical); *antidependency cycle* in serializability theory (A's read→B's write
   > edge plus B's write→A's write edge closes a loop in the precedence graph, so the schedule is not
-  > conflict-serializable — CoAgent lists this by name); *A1 Stale-Generation* in arXiv:2606.17182.
+  > conflict-serializable — [CoAgent](reference/papers.md) lists this by name); *A1 Stale-Generation*
+  > in the [concurrency-anomalies catalog](reference/papers.md) (arXiv:2606.17182).
   >
   > The classical remedies map one-to-one onto §5.2's open question: hold read locks to
   > end-of-transaction (**strict 2PL** = full span) versus validate at write time (**OCC** = version
   > check). §5.2 is therefore not a novel dilemma — it is 2PL-vs-OCC, and what makes it hard again
   > is only that both textbook answers assume short transactions.
 
-**R7 — Lock service violates its contract.** *(Relabelled 2026-08-27 — it was "split-brain DLM",
-which is misleading.)* Force the fake to grant the same lock to two holders. Baseline: concurrent
-writes. Harness: at most one write lands, because tickets are monotonic and the loser's is stale.
-*Proves: correctness survives the lock service breaking its promise, not just agents failing. A4
-Split-View.*
+**R7 — Lock service violates its contract.** *Named for what it actually tests — not "split-brain
+DLM," a name that would be misleading here (see below).* Force the fake to grant the same lock to two
+holders. Baseline: concurrent writes. Harness: at most one write lands, because tickets are monotonic
+and the loser's is stale. *Proves: correctness survives the lock service breaking its promise, not
+just agents failing. This is [A4 Split-View](reference/papers.md) from the concurrency-anomalies
+catalog.*
 
-  > **Why the old name was wrong: etcd cannot split-brain.** Under partition the majority side serves
+  > **Why this isn't called "split-brain": etcd cannot split-brain.** Under partition the majority side serves
   > and the minority side rejects all writes — Raft quorum means a minority partition cannot elect a
   > leader. No correct etcd ever hands one lock to two holders. So this is **defence in depth against a
   > scenario a correct backend does not produce**, not a realistic partition, and it must be reported
@@ -221,7 +268,7 @@ so something retries it while the lock is still held. Harness: no double-hold, n
 no lock left stuck. *Proves re-entrancy handling in the
 harness's own wrapper — the one piece of lock code agents cannot be blamed for.*
 
-  > **Verified legitimate 2026-08-27** (it was the only race here originally written with no source).
+  > **This race is documented, real behavior, not a hypothetical.**
   > See [`reference/lock-primitives.md`](reference/lock-primitives.md). It fails in **both**
   > directions, which is the useful part: a *non-reentrant* lock re-acquired by a retry "would block
   > indefinitely" (self-deadlock, one agent, zero contention), while a *reentrant* one counts
@@ -280,33 +327,38 @@ revokes there, then the rename proceeds. Harness: the write must **not** land. *
   > resource-storage decision empirically instead of by argument.
 
 **R10 — Out-of-order effects.** `write_order: permuted`, multiple writes in one held span.
-Harness: externalized in issue order, or refused. *Proves: A6. Lower priority for v1's single-file
-resource; include the knob, defer the race.*
+Harness: externalized in issue order, or refused. *Proves: [A6 Tool-Effect
+Reordering](reference/papers.md). Lower priority for v1's single-file resource; include the knob,
+defer the race.*
 
 ---
 
-## 5. What R4 forces — a correction to the full-span recommendation
+## 5. What R4 forces on the span decision
 
-I previously recommended the §5.2 full-span lock as the v1 correctness baseline on the grounds that
-it is self-sufficient (it absorbs staleness for free). **R4 shows that recommendation was too
-clean, and the reason is specific rather than general.**
+Handover §5.2 records full-span locking (holding across read-decide-write, not just the write) as an
+open alternative, attractive because it absorbs content staleness for free (R6). **R4 shows that
+attraction is not the whole story**, for a reason specific to this design rather than a general
+objection to full-span locking:
 
 The argument, in three steps:
 
-1. A full-span lock is held across `decide_ms`, i.e. across inference — minutes, per CoAgent §3.3.
+1. A full-span lock is held across `decide_ms`, i.e. across inference — minutes, per
+   [CoAgent §3.3](reference/papers.md).
 2. To survive that span, the lease must either be very long or be renewed. Renewal is
    liveness-based: it proves the holder's *process* is alive.
-3. **A hung-but-alive holder renews successfully forever.** pi#5778 establishes this state arises
-   from ordinary causes — a dropped stream, an unresolved promise — and that the process "silently
-   dies in the background" while staying up. So the renewal machinery that makes full-span viable
-   is precisely what defeats the §5 lease backstop.
+3. **A hung-but-alive holder renews successfully forever.** [pi#5778](reference/field-reports.md)
+   establishes this state arises from ordinary causes — a dropped stream, an unresolved promise —
+   and that the process "silently dies in the background" while staying up. So the renewal machinery
+   that makes full-span viable is precisely what defeats the §5 lease backstop.
 
-Handover §5's backstop covers **process death**. It does not cover **liveness without progress**,
-and §5 does not currently distinguish these. R4 is the test that makes the gap visible.
+Handover §5's backstop covers **process death**. It does not cover **liveness without progress** —
+a hung-but-alive holder is neither dead nor healthy in the sense the lease checks for. R4 is the
+test that makes this gap visible.
 
-An earlier draft of this section claimed a progress-based lease is impossible because "there is no
-signal." **That was too strong — corrected below in §5.2.** A signal exists during streaming decode
-and is absent during tool execution, so the answer is per-phase rather than global.
+It is tempting to conclude a progress-based lease is simply impossible, on the grounds that "there
+is no signal" for whether a holder is converging. That is too strong: a signal *does* exist during
+streaming decode (§1.1) and is genuinely absent only during tool execution, so the right answer is
+per-phase rather than a single global verdict — worked out in §5.2.
 
 **The trilemma — and none of the three is free:**
 
@@ -321,9 +373,9 @@ budgets are v1 design parameters, not implementation details.**
 
 ### 5.2 What the signal actually is, per phase
 
-The correction: "is this agent alive?" is sometimes unanswerable, but **"has this phase exceeded its
-budget?" is always answerable.** Stop asking the first question. The enforceable mechanism is a
-per-phase watchdog, and the phases have genuinely different observability (§2):
+"Is this agent alive?" is sometimes unanswerable (§1.1). **"Has this phase exceeded its budget?" is
+always answerable.** So the enforceable mechanism asks the second question, not the first: a
+per-phase watchdog, sized to each phase's genuinely different observability (§2):
 
 | Phase | Signal available | Enforceable check |
 |---|---|---|
@@ -331,9 +383,10 @@ per-phase watchdog, and the phases have genuinely different observability (§2):
 | Decode, non-streaming | none | whole-call timeout — coarse |
 | Tool execution | none | per-tool deadline — coarse |
 
-Independent confirmation that this is the right decomposition: it is precisely the fix proposed in
-pi#5778 — `streamTimeoutMs` (chunk wait), `toolTimeoutMs` (overall), per-tool `timeoutMs` override.
-Three knobs because three phases, arrived at from the bug rather than from theory.
+This decomposition is not invented for this project — it is precisely the fix proposed in
+[pi#5778](reference/field-reports.md): `streamTimeoutMs` (chunk wait), `toolTimeoutMs` (overall),
+per-tool `timeoutMs` override. Three knobs because three phases, arrived at there from the bug
+itself rather than from theory, and reused here for the same reason.
 
 Two caveats to keep honest:
 
@@ -345,11 +398,11 @@ Two caveats to keep honest:
   timeout instead of a per-chunk one. Worth noting because it means serving mode changes how tightly
   the ceiling can be set, not whether R4 is addressable at all.
 
-**Consequence for §5.2, stated plainly:** the reason to avoid holding across thinking was R4's
+**Where this leaves the span decision:** the reason to avoid holding across thinking was R4's
 unkillable holder. If inter-token timeouts make decode-phase hangs detectable, holding across decode
-is less dangerous than the first draft of this section argued, and full-span keeps R6 for free. The
+is less dangerous than §5's three-step argument alone suggests, and full-span keeps R6 for free. The
 residual risk concentrates in tool-execution phases, where no signal exists and only blind deadlines
-apply. **This tilts §5.2 toward full-span without settling it** — and it makes serving mode
+apply. **This tilts the decision toward full-span without settling it** — and it makes serving mode
 (streaming or not) an input to that decision, which handover §5.2 does not currently mention.
 
 ### 5.3 Revocation via fencing token — R4's constructive answer
@@ -460,18 +513,19 @@ whole unit — the double take becomes inexpressible rather than merely discoura
 
 **Write-then-rename: what it buys and what it does not — OPEN, needs verifying not assuming.**
 The proposal is to never write the resource in place: build the new content in a temporary file, then
-`rename()` it over the target. Two distinct benefits, worth keeping separate because an earlier draft
-of this section conflated them:
+`rename()` it over the target. It buys two genuinely distinct benefits, worth keeping separate rather
+than treating as one:
 
 1. **Crash safety (solid).** `rename()` is atomic with respect to readers — a reader sees the old file
    or the new one, never a mixture. So a harness that dies mid-write leaves no partial file. This one
    is genuinely settled, with the standard caveats: same filesystem only (a cross-filesystem rename is
    a copy, not atomic), and durability needs `fsync` of the temp file and then of the directory —
    atomicity is not durability.
-2. **Shrinking the check-to-commit window (partial).** Here is the correction. Revocation does not
-   *interrupt* our write — the harness is still running and nothing stops it mid-syscall. The real
-   hazard is subtler: the write **completes successfully even though the lock was revoked partway
-   through**, producing a landed write with a stale ticket — a P2 violation, not a corrupt file.
+2. **Shrinking the check-to-commit window (partial).** The intuitive failure mode — "revocation
+   interrupts our write mid-flight" — is not actually what happens: the harness is still running and
+   nothing stops it mid-syscall. The real hazard is subtler: the write **completes successfully even
+   though the lock was revoked partway through**, producing a landed write with a stale ticket — a P2
+   violation, not a corrupt file.
    Write-then-rename helps because it splits the work into *prepare* (no effect on the resource) and
    *commit* (one instantaneous `rename`). Check the ticket immediately before the rename and the gap
    shrinks from "however long it takes to write the whole file" to "one syscall."
@@ -535,8 +589,9 @@ better number.
 firing costs. The lock is revoked, the token bumped, and the slow agent's eventual write is rejected
 at the write-time fencing check — rejected, not corrupted, not interleaved. **A wrong deadline costs
 wasted work, never incorrectness.** Safety rests on the fencing comparison, an integer check with no
-timing judgment in it; timing affects only liveness and throughput. This is exactly Kleppmann's
-argument for fencing tokens, and it is what licenses being sloppy about the threshold. The
+timing judgment in it; timing affects only liveness and throughput. This is exactly
+[Kleppmann](handover.md)'s argument for fencing tokens (handover §6), and it is what licenses being
+sloppy about the threshold. The
 requirements reduce to: eventually fires, usually generous. R11 is the test of it.
 
 **Where it still bites: heavy tails.** LLM latency is heavy-tailed — p99 many multiples of p50, plus
@@ -559,9 +614,10 @@ actually predictable. Under full span the lock inherits the full remote-latency 
 If holding across a remote call is unavoidable, do not use a constant: estimate from observed
 latency and widen on every false revocation — TCP's RTO estimator (smoothed mean + deviation), or an
 eventually-perfect failure detector that relaxes its timeout each time it is caught being wrong.
-Continuum is precedent for treating the variable part as variable: its TTL is derived from queueing
-delay, not fixed. Watch for **correlated revocation** — a load spike overruns many holders at once
-and they all retry together, an abort storm (the `load_spike_at` knob, R11's second half).
+[Continuum](reference/papers.md) is precedent for treating the variable part as variable: its TTL is
+derived from queueing delay, not fixed. Watch for **correlated revocation** — a load spike overruns
+many holders at once and they all retry together, an abort storm (the `load_spike_at` knob, R11's
+second half).
 
 **Where this leaves §5.2 — no longer balanced.** Full span buys exactly one thing, R6 staleness for
 free, and costs: four exposure windows inflated from milliseconds to minutes (§6.2), R10 reactivated,
@@ -578,10 +634,10 @@ see §6.6.
 
 ## 6. The demo: a conformance table
 
-Handover §8's demo is redefined (2026-08-27) as **a conformance run, not a narrative**. No injected
-bugs, no story about wrong code, no rework parable. Run every race against two implementations —
-the harness, and an unprotected baseline — and print the table. The mechanism either gates
-correctly or it does not, and the table says which.
+The demo handover §8 asks for is **a conformance run, not a narrative**: no injected bugs, no story
+about wrong code, no rework parable. Run every race against two implementations — the harness, and
+an unprotected baseline — and print the table. The mechanism either gates correctly or it does not,
+and the table says which.
 
 ### 6.1 The finding that should lead the demo
 
@@ -637,8 +693,8 @@ That is the actual trade, and it is less symmetric than §5.2 currently reads.
 
 ### 6.4 What the table admits
 
-**Updated 2026-08-27 after implementing v1.** Three of the predicted failures did not survive
-contact with the code, in different ways:
+This section compares what §6.3 predicted against what the v1 implementation actually does. Three of
+the predicted failures did not survive contact with the code, in different ways:
 
 - **R6 now passes on the write-only span.** The predicted failure was conditional on *not* building
   the freshness check; the implementation builds it (the content version lives in the lock service,
@@ -661,13 +717,7 @@ Two entries are still not passes, and the demo prints them as-is rather than qui
 1. **R12 harness death and restart is deferred**, not passing. v1 ships only the rule that makes a
    restart safe — tickets come from the lock service, never harness memory — and does not exercise a
    restart, which needs the process boundary.
-1b. ~~**R14 is an expected failure.**~~ **Passes as implemented** — putting the content version in
-   the lock service (§7 D5) plus a version guard before the rename handles it. The residual
-   one-syscall gap stands.
-2. ~~**R9 is unspecified.**~~ **Resolved and implemented 2026-08-27** — on failure start over from
-   taking the lock; a nested take is not expressible through the mediated API. See R9's note. It also stopped being a pure implementation concern:
-   under full span it is *agent*-reachable, under write-only it is not.
-3. **R4 under full span** passes only conditionally, and one condition (tool-phase hangs) has no
+2. **R4 under full span** passes only conditionally, and one condition (tool-phase hangs) has no
    signal — only a blind deadline. It is not a clean pass and should not be printed as one.
 
 Everything else is a clean pass, which is the useful result: **8 clean passes, 1 declared out of
@@ -699,8 +749,9 @@ A demo that only showed the harness column would look like the lock is free.
 
 Unchanged from handover §8: multi-lock/deadlock policy (handover §7.3 — `n_resources` exists as a
 knob, the race is deferred), static verification of lock discipline in generated code (handover §5.1
-and §7.5), throughput optimization (handover §7.6). Add to that list: A2 Phantom-Tool, which needs a mutable tool
-registry that v1's single-file resource does not have; R10, whose knob ships without its race; and
+and §7.5), throughput optimization (handover §7.6). Add to that list: [A2
+Phantom-Tool](reference/papers.md), which needs a mutable tool registry that v1's single-file
+resource does not have; R10, whose knob ships without its race; and
 **R5 plus everything in §5.4** — verification gating, two-tier visibility, recoverability
 machinery. v1 is a lock and nothing else. Also **R12 / harness failover** (§5.4c): v1 ships the
 token-source rule that makes a restart safe, but does not test restart itself.
