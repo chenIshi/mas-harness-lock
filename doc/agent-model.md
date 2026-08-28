@@ -55,20 +55,16 @@ a "may" to eventually become a "would" *of* — see §2, where the event alphabe
 `acquire`/`release` events for exactly this reason.
 
 **Fact 2 — decode has two distinct capability modes, and the harness's ability to detect a hang
-differs between them.**
-
-- **Streaming decode.** Tokens arrive one at a time, so each arriving token is a liveness signal. A
-  stream that goes quiet mid-generation is observable — this is the exact dropped-connection failure
-  in [pi#5778](reference/field-reports.md).
-- **Non-streaming (batched) decode.** One blocking call, response ready or not. No intermediate
-  signal exists between the call starting and it returning; a hang here is indistinguishable from a
-  slow-but-healthy response until a whole-call timeout fires.
-- **Tool execution is a separate phase from decode, in either mode, and it is never streamed** — a
-  tool call is one blocking operation with no token-like heartbeat, by definition. This is where
-  [pi#5778](reference/field-reports.md)'s
-  *second* unbounded wait lived, and in an agentic tool-calling loop it is the phase where long
-  unobserved waits actually concentrate: a tool call must complete before the agent can continue no
-  matter how its decode is served.
+differs between them.** Streaming decode emits tokens one at a time, so each arriving token is a
+liveness signal — a stream that goes quiet mid-generation is observable, which is the exact
+dropped-connection failure in [pi#5778](reference/field-reports.md). Non-streaming decode is one
+blocking call, response ready or not, with no signal in between, so a hang here is indistinguishable
+from a slow-but-healthy response until a whole-call timeout fires — and tool execution behaves the
+same way *regardless of decode mode*, because a tool call is one blocking operation with no
+token-like heartbeat, by definition. That makes tool calls the phase where long unobserved waits
+actually concentrate in an agentic loop: a tool call must complete before the agent can continue no
+matter how its decode is served, and it is where [pi#5778](reference/field-reports.md)'s *second*
+unbounded wait lived.
 
 These two facts are why the model needs a `streaming` flag and a `hang_at` phase marker (§3): "is
 this agent alive?" has a different answer depending on which phase it is in, and that difference has
