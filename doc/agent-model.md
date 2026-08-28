@@ -43,12 +43,13 @@ particular agent *will* do on a given run — see §1.2 for why that distinction
 ### 1.1 Two capability facts that drive the whole design
 
 **Fact 1 — anything an agent's generated code may get wrong, it must be treated as eventually
-getting wrong.** If agent-generated code could call lock `acquire`/`release` directly, "an agent
-might forget the matching release" is not a tail risk to discount — over enough runs it becomes "an
-agent will forget it," for exactly the reason [`handover.md`](handover.md)'s §1 gives for why a
-coordination guarantee cannot live in a prompt or a role label: a guarantee that depends on every
-call site being written correctly survives only until the first one is not. §1.2 below applies that
-argument at this level; it is not re-derived here. The consequence for design: handover §5's option
+getting wrong.** If agent-generated code could call lock `acquire`/`release` directly, then across
+enough runs, whatever *can* go wrong at any one of those call sites — for example, an agent forgetting
+the matching release — *will* go wrong at least once, and that single mistake is enough to break the
+guarantee for every other agent, not just the one that made it. This is exactly the reason
+[`handover.md`](handover.md)'s §1 gives for why a coordination guarantee cannot live in a prompt or a
+role label. §1.2 below applies that argument at this level; it is not re-derived here. The
+consequence for design: handover §5's option
 (a) removes raw lock primitives from the agent's reachable surface entirely, so there is nothing for
 a "may" to eventually become a "would" *of* — see §2, where the event alphabet has no
 `acquire`/`release` events for exactly this reason.
