@@ -32,14 +32,17 @@ spans. Layout: `src/types.rs` (Ticket/Version/Span/Refusal), `src/history.rs`, `
 (trait + fake with fault injection), `src/store.rs` (temp-file + rename), `src/harness.rs`,
 `src/checker.rs` (the eight properties), `tests/`, `examples/demo.rs`.
 
+`README.md` is the entry point; **`doc/code-structure.md`** is the reader's map of the
+implementation — module layering, the lifecycle of a write, and a "where the bodies are buried"
+list. Update it when module responsibilities change.
+
 Design docs remain authoritative for *why*: `doc/handover.md`, `doc/agent-model.md`,
 `doc/test-design.md`, `doc/lock-interface.md`, `doc/reference/`. `doc/milestone/` and `doc/tmp/`
 are empty placeholders.
 
 `doc/handover.md` is the authoritative source: read it before proposing or writing anything. It
 records not just decisions but which decisions are deliberately still open (§7), and several
-"obvious" simplifications are already-rejected or already-published negative results. When
-implementation begins, whatever build/test tooling gets chosen should be documented here.
+"obvious" simplifications are already-rejected or already-published negative results.
 
 - `doc/agent-model.md` — spec for the scripted "error-prone agent" that stands in for an LLM agent
   in v1: event alphabet (§2), parameters (§3), and named races R1–R12 (§4). Its §6.3 table is the
